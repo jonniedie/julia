@@ -1202,16 +1202,20 @@ static jl_typemap_entry_t *jl_typemap_morespecific_by_type(jl_typemap_entry_t *f
 static jl_method_instance_t *jl_mt_assoc_by_type(jl_methtable_t *mt, jl_datatype_t *tt, size_t world)
 {
     // caller must hold the mt->writelock
-    if (tt->isdispatchtuple) {
-        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
-        if (entry && entry->func.value)
-            return entry->func.linfo;
+    assert(tt->isdispatchtuple);
+    jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
+    if (entry) {
+        do {
+            if (entry->min_world <= world && world <= entry->max_world)
+                return entry->func.linfo;
+            entry = entry->next;
+        } while ((jl_value_t*)entry != jl_nothing);
     }
+
     struct jl_typemap_assoc search = {(jl_value_t*)tt, world, NULL, 0, ~(size_t)0};
-    jl_typemap_entry_t *entry = jl_typemap_assoc_by_type(mt->cache, &search, jl_cachearg_offset(mt), /*subtype*/1);
+    entry = jl_typemap_assoc_by_type(mt->cache, &search, jl_cachearg_offset(mt), /*subtype*/1);
     if (entry)
         return entry->func.linfo;
-
 
     jl_method_instance_t *nf = NULL;
     jl_svec_t *newparams = NULL;
@@ -2841,38 +2845,6 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, int offs,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
                               size_t world, size_t *min_valid, size_t *max_valid)
 {
-    if (jl_is_dispatch_tupletype((jl_value_t*)type)) {
-        jl_array_t *cache = jl_atomic_load_relaxed(&mt->leafcache);
-        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(cache, (jl_value_t*)type, NULL);
-        if (entry) {
-            do {
-                if (entry->min_world <= world && entry->max_world >= world) {
-                    jl_method_instance_t *mi = entry->func.linfo;
-                    jl_method_t *meth = mi->def.method;
-                    jl_value_t *tpenv2 = (jl_value_t*)jl_emptysvec;
-                    jl_value_t *types2 = NULL;
-                    JL_GC_PUSH2(&tpenv2, &types2);
-                    if (jl_egal((jl_value_t*)type, mi->specTypes)) {
-                        tpenv2 = (jl_value_t*)mi->sparam_vals;
-                        types2 = mi->specTypes;
-                    }
-                    else {
-                        // TODO: should we use jl_subtype_env instead (since we know that `type <: meth->sig` by transitivity)
-                        types2 = jl_type_intersection_env((jl_value_t*)type, (jl_value_t*)meth->sig, (jl_svec_t**)&tpenv2);
-                    }
-                    types2 = (jl_value_t*)jl_svec(4, types2, tpenv2, meth, jl_true);
-                    tpenv2 = (jl_value_t*)jl_alloc_vec_any(1);
-                    jl_array_ptr_set(tpenv2, 0, types2);
-                    *min_valid = entry->min_world;
-                    *max_valid = entry->max_world;
-                    JL_GC_POP();
-                    return tpenv2;
-                }
-                entry = entry->next;
-            } while ((jl_value_t*)entry != jl_nothing);
-        }
-    }
-
     jl_typemap_t *defs = mt->defs;
     jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)type);
     assert(jl_is_datatype(unw));
@@ -2897,6 +2869,53 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, int offs,
     env.max_valid = *max_valid;
     struct jl_typemap_assoc search = {(jl_value_t*)type, world, jl_emptysvec, env.min_valid, env.max_valid};
     JL_GC_PUSH5(&env.t, &env.matc, &env.match.env, &search.env, &env.match.ti);
+
+    if (jl_is_dispatch_tupletype((jl_value_t*)type)) {
+        jl_array_t *cache = jl_atomic_load_relaxed(&mt->leafcache);
+        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(cache, (jl_value_t*)type, NULL);
+        if (entry) {
+            do {
+                if (entry->min_world <= world && entry->max_world >= world) {
+                    jl_method_instance_t *mi = entry->func.linfo;
+                    jl_method_t *meth = mi->def.method;
+                    if (jl_egal((jl_value_t*)type, mi->specTypes)) {
+                        env.match.env = mi->sparam_vals;
+                        env.match.ti = mi->specTypes;
+                    }
+                    else {
+                        // TODO: should we use jl_subtype_env instead (since we know that `type <: meth->sig` by transitivity)
+                        env.match.ti = jl_type_intersection_env((jl_value_t*)type, (jl_value_t*)meth->sig, &env.match.env);
+                    }
+                    env.matc = jl_svec(4, env.match.ti, env.match.env, meth, jl_true);
+                    env.t = (jl_value_t*)jl_alloc_vec_any(1);
+                    jl_array_ptr_set(env.t, 0, env.matc);
+                    if (*min_valid < entry->min_world)
+                        *min_valid = entry->min_world;
+                    if (*max_valid > entry->max_world)
+                        *max_valid = entry->max_world;
+                    JL_GC_POP();
+                    return env.t;
+                }
+                entry = entry->next;
+            } while ((jl_value_t*)entry != jl_nothing);
+        }
+        entry = jl_typemap_assoc_by_type(mt->cache, &search, jl_cachearg_offset(mt), /*subtype*/1);
+        if (entry && entry->guardsigs == jl_emptysvec) {
+            jl_method_instance_t *mi = entry->func.linfo;
+            jl_method_t *meth = mi->def.method;
+            // TODO: should we use jl_subtype_env instead (since we know that `type <: meth->sig` by transitivity)
+            env.match.ti = jl_type_intersection_env((jl_value_t*)type, (jl_value_t*)meth->sig, &env.match.env);
+            env.matc = jl_svec(4, env.match.ti, env.match.env, meth, jl_true);
+            env.t = (jl_value_t*)jl_alloc_vec_any(1);
+            jl_array_ptr_set(env.t, 0, env.matc);
+            *min_valid = entry->min_world;
+            *max_valid = entry->max_world;
+            JL_GC_POP();
+            return env.t;
+        }
+        search.min_valid = env.min_valid;
+        search.max_valid = env.max_valid;
+    }
     htable_new(&env.visited, 0);
     if (((jl_datatype_t*)unw)->isdispatchtuple) {
         jl_typemap_entry_t *ml = jl_typemap_assoc_by_type(defs, &search, offs, /*subtype*/1);

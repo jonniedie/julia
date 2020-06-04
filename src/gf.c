@@ -936,6 +936,19 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
     return 1;
 }
 
+static inline jl_typemap_entry_t *lookup_leafcache(jl_array_t *leafcache, jl_value_t *tt, size_t world)
+{
+    jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(leafcache, (jl_value_t*)tt, NULL);
+    if (entry) {
+        do {
+            if (entry->min_world <= world && world <= entry->max_world)
+                return entry;
+            entry = entry->next;
+        } while ((jl_value_t*)entry != jl_nothing);
+    }
+    return NULL;
+}
+
 static jl_method_instance_t *cache_method(
         jl_methtable_t *mt, jl_typemap_t **cache, jl_value_t *parent JL_PROPAGATES_ROOT,
         jl_tupletype_t *tt, // the original tupletype of the signature
@@ -948,8 +961,9 @@ static jl_method_instance_t *cache_method(
     int8_t offs = mt ? jl_cachearg_offset(mt) : 1;
     { // scope block
         if (mt) {
-            jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
-            if (entry && entry->func.value)
+            jl_array_t *leafcache = jl_atomic_load_relaxed(&mt->leafcache);
+            jl_typemap_entry_t *entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+            if (entry)
                 return entry->func.linfo;
         }
         struct jl_typemap_assoc search = {(jl_value_t*)tt, world, NULL, 0, ~(size_t)0};
@@ -1204,14 +1218,10 @@ static jl_method_instance_t *jl_mt_assoc_by_type(jl_methtable_t *mt, jl_datatype
 {
     // caller must hold the mt->writelock
     assert(tt->isdispatchtuple);
-    jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
-    if (entry) {
-        do {
-            if (entry->min_world <= world && world <= entry->max_world)
-                return entry->func.linfo;
-            entry = entry->next;
-        } while ((jl_value_t*)entry != jl_nothing);
-    }
+    jl_array_t *leafcache = jl_atomic_load_relaxed(&mt->leafcache);
+    jl_typemap_entry_t *entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+    if (entry)
+        return entry->func.linfo;
 
     struct jl_typemap_assoc search = {(jl_value_t*)tt, world, NULL, 0, ~(size_t)0};
     entry = jl_typemap_assoc_by_type(mt->cache, &search, jl_cachearg_offset(mt), /*subtype*/1);
@@ -1715,14 +1725,14 @@ JL_DLLEXPORT void jl_method_table_disable(jl_methtable_t *mt, jl_method_t *metho
     (void)check_ambiguous_matches(mt->defs, methodentry, check_disabled_ambiguous_visitor);
     // drop this method from mt->cache
     struct invalidate_mt_env mt_cache_env;
-    mt_cache_env.max_world = methodentry->max_world - 1;
+    mt_cache_env.max_world = methodentry->max_world;
     mt_cache_env.shadowed = (jl_value_t*)method;
     jl_typemap_visitor(mt->cache, invalidate_mt_cache, (void*)&mt_cache_env);
     jl_array_t *leafcache = mt->leafcache;
     size_t i, l = jl_array_len(leafcache);
-    for (i = 0; i < l; i++) {
+    for (i = 1; i < l; i += 2) {
         jl_value_t *l = jl_array_ptr_ref(leafcache, i);
-        if (l)
+        if (l && l != jl_nothing)
             invalidate_mt_cache((jl_typemap_entry_t*)l, (void*)&mt_cache_env);
     }
     // Invalidate the backedges
@@ -1819,9 +1829,9 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
         jl_typemap_visitor(mt->cache, invalidate_mt_cache, (void*)&mt_cache_env);
         jl_array_t *leafcache = mt->leafcache;
         size_t i, l = jl_array_len(leafcache);
-        for (i = 0; i < l; i++) {
+        for (i = 1; i < l; i += 2) {
             jl_value_t *l = jl_array_ptr_ref(leafcache, i);
-            if (l)
+            if (l && l != jl_nothing)
                 invalidate_mt_cache((jl_typemap_entry_t*)l, (void*)&mt_cache_env);
         }
         //TODO: if it's small, might it be better to drop it all?
@@ -1919,14 +1929,10 @@ jl_method_instance_t *jl_method_lookup(jl_value_t **args, size_t nargs, size_t w
     if (entry)
         return entry->func.linfo;
     jl_tupletype_t *tt = arg_type_tuple(args[0], &args[1], nargs);
-    entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
-    if (entry) {
-        do {
-            if (entry->min_world <= world && world <= entry->max_world)
-                return entry->func.linfo;
-            entry = entry->next;
-        } while ((jl_value_t*)entry != jl_nothing);
-    }
+    jl_array_t *leafcache = jl_atomic_load_relaxed(&mt->leafcache);
+    entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+    if (entry)
+        return entry->func.linfo;
     JL_GC_PUSH1(&tt);
     JL_LOCK(&mt->writelock);
     jl_method_instance_t *sf = jl_mt_assoc_by_type(mt, tt, world);
@@ -2407,14 +2413,8 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         entry = jl_typemap_assoc_exact(mt->cache, F, args, nargs, jl_cachearg_offset(mt), world);
         if (entry == NULL) {
             tt = arg_type_tuple(F, args, nargs);
-            entry = (jl_typemap_entry_t*)jl_eqtable_get(mt->leafcache, (jl_value_t*)tt, NULL);
-            while (entry) {
-                if (entry->min_world <= world && world <= entry->max_world)
-                    break;
-                entry = entry->next;
-                if ((jl_value_t*)entry == jl_nothing)
-                    entry = NULL;
-            }
+            jl_array_t *leafcache = jl_atomic_load_relaxed(&mt->leafcache);
+            entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
         }
         if (entry && entry->isleafsig && entry->simplesig == (void*)jl_nothing && entry->guardsigs == jl_emptysvec) {
             // put the entry into the cache if it's valid for a leafsig lookup,
@@ -2873,33 +2873,28 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, int offs,
     JL_GC_PUSH5(&env.t, &env.matc, &env.match.env, &search.env, &env.match.ti);
 
     if (jl_is_dispatch_tupletype((jl_value_t*)type)) {
-        jl_array_t *cache = jl_atomic_load_relaxed(&mt->leafcache);
-        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_eqtable_get(cache, (jl_value_t*)type, NULL);
+        jl_array_t *leafcache = jl_atomic_load_relaxed(&mt->leafcache);
+        jl_typemap_entry_t *entry = lookup_leafcache(leafcache, (jl_value_t*)type, world);
         if (entry) {
-            do {
-                if (entry->min_world <= world && entry->max_world >= world) {
-                    jl_method_instance_t *mi = entry->func.linfo;
-                    jl_method_t *meth = mi->def.method;
-                    if (jl_egal((jl_value_t*)type, mi->specTypes)) {
-                        env.match.env = mi->sparam_vals;
-                        env.match.ti = mi->specTypes;
-                    }
-                    else {
-                        // TODO: should we use jl_subtype_env instead (since we know that `type <: meth->sig` by transitivity)
-                        env.match.ti = jl_type_intersection_env((jl_value_t*)type, (jl_value_t*)meth->sig, &env.match.env);
-                    }
-                    env.matc = jl_svec(3, env.match.ti, env.match.env, meth);
-                    env.t = (jl_value_t*)jl_alloc_vec_any(1);
-                    jl_array_ptr_set(env.t, 0, env.matc);
-                    if (*min_valid < entry->min_world)
-                        *min_valid = entry->min_world;
-                    if (*max_valid > entry->max_world)
-                        *max_valid = entry->max_world;
-                    JL_GC_POP();
-                    return env.t;
-                }
-                entry = entry->next;
-            } while ((jl_value_t*)entry != jl_nothing);
+            jl_method_instance_t *mi = entry->func.linfo;
+            jl_method_t *meth = mi->def.method;
+            if (jl_egal((jl_value_t*)type, mi->specTypes)) {
+                env.match.env = mi->sparam_vals;
+                env.match.ti = mi->specTypes;
+            }
+            else {
+                // TODO: should we use jl_subtype_env instead (since we know that `type <: meth->sig` by transitivity)
+                env.match.ti = jl_type_intersection_env((jl_value_t*)type, (jl_value_t*)meth->sig, &env.match.env);
+            }
+            env.matc = jl_svec(3, env.match.ti, env.match.env, meth);
+            env.t = (jl_value_t*)jl_alloc_vec_any(1);
+            jl_array_ptr_set(env.t, 0, env.matc);
+            if (*min_valid < entry->min_world)
+                *min_valid = entry->min_world;
+            if (*max_valid > entry->max_world)
+                *max_valid = entry->max_world;
+            JL_GC_POP();
+            return env.t;
         }
         entry = jl_typemap_assoc_by_type(mt->cache, &search, jl_cachearg_offset(mt), /*subtype*/1);
         if (entry && entry->guardsigs == jl_emptysvec) {
